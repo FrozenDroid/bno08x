@@ -4,10 +4,10 @@ LICENSE: BSD3 (see LICENSE file)
 */
 
 use crate::interface::{SensorInterface, PACKET_HEADER_LENGTH};
-use embedded_hal::blocking::delay::DelayMs;
 
 use core::ops::Shr;
 
+use embedded_hal::delay::DelayNs;
 #[cfg(feature = "rttdebug")]
 use panic_rtt_core::rprintln;
 
@@ -104,7 +104,7 @@ where
     SE: core::fmt::Debug,
 {
     /// Consume all available messages on the port without processing them
-    pub fn eat_all_messages(&mut self, delay: &mut impl DelayMs<u8>) {
+    pub fn eat_all_messages(&mut self, delay: &mut impl DelayNs) {
         #[cfg(feature = "rttdebug")]
         rprintln!("eat_n");
         loop {
@@ -113,14 +113,14 @@ where
                 break;
             }
             //give some time to other parts of the system
-            delay.delay_ms(1);
+            // delay.delay_ms(1);
         }
     }
 
     /// Handle any messages with a timeout
     pub fn handle_all_messages(
         &mut self,
-        delay: &mut impl DelayMs<u8>,
+        delay: &mut impl DelayNs,
         timeout_ms: u8,
     ) -> u32 {
         let mut total_handled: u32 = 0;
@@ -131,7 +131,7 @@ where
             } else {
                 total_handled += handled_count;
                 //give some time to other parts of the system
-                delay.delay_ms(1);
+                // delay.delay_ms(1);
             }
         }
         total_handled
@@ -140,14 +140,14 @@ where
     /// return the number of messages handled
     pub fn handle_one_message(
         &mut self,
-        delay: &mut impl DelayMs<u8>,
+        delay: &mut impl DelayNs,
         max_ms: u8,
     ) -> u32 {
         let mut msg_count = 0;
 
         let res = self.receive_packet_with_timeout(delay, max_ms);
         if res.is_ok() {
-            let received_len = res.unwrap_or(0);
+            let received_len = res.unwrap();
             if received_len > 0 {
                 msg_count += 1;
                 self.handle_received_packet(received_len);
@@ -163,7 +163,7 @@ where
     /// Receive and ignore one message,
     /// returning the size of the packet received or zero
     /// if there was no packet to read.
-    pub fn eat_one_message(&mut self, delay: &mut impl DelayMs<u8>) -> usize {
+    pub fn eat_one_message(&mut self, delay: &mut impl DelayNs) -> usize {
         let res = self.receive_packet_with_timeout(delay, 150);
         return if let Ok(received_len) = res {
             #[cfg(feature = "rttdebug")]
@@ -261,15 +261,6 @@ where
         }
 
         let payload_len = received_len - outer_cursor;
-        if payload_len < 14 {
-            #[cfg(feature = "rttdebug")]
-            rprintln!(
-                "bad report: {:?}",
-                &self.packet_recv_buf[..PACKET_HEADER_LENGTH]
-            );
-
-            return;
-        }
 
         // there may be multiple reports per payload
         while outer_cursor < payload_len {
@@ -452,24 +443,24 @@ where
     /// waiting for the application to configure it.
     pub fn init(
         &mut self,
-        delay_source: &mut impl DelayMs<u8>,
+        delay_source: &mut impl DelayNs,
     ) -> Result<(), WrapperError<SE>> {
         #[cfg(feature = "rttdebug")]
         rprintln!("wrapper init");
 
         //Section 5.1.1.1 : On system startup, the SHTP control application will send
         // its full advertisement response, unsolicited, to the host.
-        delay_source.delay_ms(1u8);
+        delay_source.delay_ms(1);
         self.sensor_interface
             .setup(delay_source)
             .map_err(WrapperError::CommError)?;
 
         if self.sensor_interface.requires_soft_reset() {
-            delay_source.delay_ms(1u8);
+            delay_source.delay_ms(1);
             self.soft_reset()?;
-            delay_source.delay_ms(150u8);
+            delay_source.delay_ms(150);
             self.eat_all_messages(delay_source);
-            delay_source.delay_ms(50u8);
+            delay_source.delay_ms(50);
             self.eat_all_messages(delay_source);
         } else {
             // we only expect two messages after reset:
@@ -589,7 +580,7 @@ where
     /// Read one packet into the receive buffer
     pub(crate) fn receive_packet_with_timeout(
         &mut self,
-        delay: &mut impl DelayMs<u8>,
+        delay: &mut impl DelayNs,
         max_ms: u8,
     ) -> Result<usize, WrapperError<SE>> {
         // #[cfg(feature = "rttdebug")]
@@ -612,7 +603,7 @@ where
     /// Verify that the sensor returns an expected chip ID
     fn verify_product_id(
         &mut self,
-        delay: &mut impl DelayMs<u8>,
+        delay: &mut impl DelayNs,
     ) -> Result<(), WrapperError<SE>> {
         #[cfg(feature = "rttdebug")]
         rprintln!("request PID...");

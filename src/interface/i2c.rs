@@ -1,7 +1,11 @@
 use super::{SensorCommon, SensorInterface, PACKET_HEADER_LENGTH};
 use crate::Error;
-use embedded_hal::blocking::delay::DelayMs;
 
+use embedded_hal::{
+    delay::DelayNs,
+    digital::{InputPin, OutputPin},
+    i2c,
+};
 #[cfg(feature = "rttdebug")]
 use panic_rtt_core::rprintln;
 
@@ -13,9 +17,8 @@ pub const ALTERNATE_ADDRESS: u8 = 0x4B;
 /// Length of our receive buffer:
 /// Note that this likely needs to be < 256 to accommodate underlying HAL
 const SEG_RECV_BUF_LEN: usize = 240;
-const MAX_SEGMENT_READ: usize = SEG_RECV_BUF_LEN;
 
-pub struct I2cInterface<I2C> {
+pub struct I2cInterface<I2C, INT, RST> {
     /// i2c port
     i2c_port: I2C,
     /// address for i2c communications with the sensor hub
@@ -25,28 +28,33 @@ pub struct I2cInterface<I2C> {
 
     /// number of packets received
     received_packet_count: usize,
+
+    int: INT,
+    rst: RST,
 }
 
-impl<I2C, CommE> I2cInterface<I2C>
+impl<I2C, CommE, INT, RST> I2cInterface<I2C, INT, RST>
 where
-    I2C: embedded_hal::blocking::i2c::Write<Error = CommE>
-        + embedded_hal::blocking::i2c::Read<Error = CommE>
-        + embedded_hal::blocking::i2c::WriteRead<Error = CommE>,
+    I2C: i2c::I2c<Error = CommE>,
+    INT: InputPin,
+    RST: OutputPin,
 {
-    pub fn default(i2c: I2C) -> Self {
-        Self::new(i2c, DEFAULT_ADDRESS)
+    pub fn default(i2c: I2C, int: INT, rst: RST) -> Self {
+        Self::new(i2c, DEFAULT_ADDRESS, int, rst)
     }
 
-    pub fn alternate(i2c: I2C) -> Self {
-        Self::new(i2c, ALTERNATE_ADDRESS)
+    pub fn alternate(i2c: I2C, int: INT, rst: RST) -> Self {
+        Self::new(i2c, ALTERNATE_ADDRESS, int, rst)
     }
 
-    pub fn new(i2c: I2C, addr: u8) -> Self {
+    pub fn new(i2c: I2C, addr: u8, int: INT, rst: RST) -> Self {
         Self {
             i2c_port: i2c,
             address: addr,
             seg_recv_buf: [0; SEG_RECV_BUF_LEN],
             received_packet_count: 0,
+            int,
+            rst,
         }
     }
 
@@ -69,8 +77,6 @@ where
         total_packet_len: usize,
         packet_recv_buf: &mut [u8],
     ) -> Result<usize, Error<CommE, ()>> {
-        let mut remaining_body_len: usize =
-            total_packet_len - PACKET_HEADER_LENGTH;
         let mut already_read_len: usize = 0;
 
         // zero packet header receive buffer
@@ -78,73 +84,14 @@ where
             *byte = 0;
         }
 
-        // #[cfg(feature = "rttdebug")]
-        // rprintln!("r.t {}", total_packet_len);
-
-        if total_packet_len < MAX_SEGMENT_READ {
-            //read directly into the provided receive buffer
-            if total_packet_len > 0 {
-                self.i2c_port
-                    .read(
-                        self.address,
-                        &mut packet_recv_buf[..total_packet_len],
-                    )
-                    .map_err(Error::Comm)?;
-                already_read_len = total_packet_len;
-            }
-        } else {
-            while remaining_body_len > 0 {
-                let whole_segment_length =
-                    remaining_body_len + PACKET_HEADER_LENGTH;
-                let segment_read_len =
-                    if whole_segment_length > MAX_SEGMENT_READ {
-                        MAX_SEGMENT_READ
-                    } else {
-                        whole_segment_length
-                    };
-                // #[cfg(feature = "rttdebug")]
-                // rprintln!("r.s {:x} {}", self.address, segment_read_len);
-
-                self.zero_recv_packet_header();
-                self.i2c_port
-                    .read(
-                        self.address,
-                        &mut self.seg_recv_buf[..segment_read_len],
-                    )
-                    .map_err(Error::Comm)?;
-
-                let promised_packet_len = SensorCommon::parse_packet_header(
-                    &self.seg_recv_buf[..PACKET_HEADER_LENGTH],
-                );
-                if promised_packet_len <= PACKET_HEADER_LENGTH {
-                    #[cfg(feature = "rttdebug")]
-                    rprintln!("WTFFF {}", promised_packet_len);
-                    return Ok(0);
-                }
-
-                //if we've never read any segments, transcribe the first packet header;
-                //otherwise, just transcribe the segment body (no header)
-                let transcribe_start_idx = if already_read_len > 0 {
-                    PACKET_HEADER_LENGTH
-                } else {
-                    0
-                };
-                let transcribe_len = if already_read_len > 0 {
-                    segment_read_len - PACKET_HEADER_LENGTH
-                } else {
-                    segment_read_len
-                };
-                packet_recv_buf
-                    [already_read_len..already_read_len + transcribe_len]
-                    .copy_from_slice(
-                        &self.seg_recv_buf[transcribe_start_idx
-                            ..transcribe_start_idx + transcribe_len],
-                    );
-                already_read_len += transcribe_len;
-
-                let body_read_len = segment_read_len - PACKET_HEADER_LENGTH;
-                remaining_body_len -= body_read_len;
-            }
+        if total_packet_len > 0 {
+            self.i2c_port
+                .read(
+                    self.address,
+                    &mut packet_recv_buf[..total_packet_len],
+                )
+                .map_err(Error::Comm)?;
+            already_read_len = total_packet_len;
         }
 
         Ok(already_read_len)
@@ -161,22 +108,31 @@ where
     }
 }
 
-impl<I2C, CommE> SensorInterface for I2cInterface<I2C>
+impl<I2C, CommE, INT, RST> SensorInterface for I2cInterface<I2C, INT, RST>
 where
-    I2C: embedded_hal::blocking::i2c::Write<Error = CommE>
-        + embedded_hal::blocking::i2c::Read<Error = CommE>
-        + embedded_hal::blocking::i2c::WriteRead<Error = CommE>,
+    I2C: i2c::I2c<Error = CommE>,
+    INT: InputPin,
+    RST: OutputPin,
 {
     type SensorError = Error<CommE, ()>;
 
     fn requires_soft_reset(&self) -> bool {
-        true
+        false
     }
 
     fn setup(
         &mut self,
-        delay_source: &mut impl DelayMs<u8>,
+        delay_source: &mut impl DelayNs,
     ) -> Result<(), Self::SensorError> {
+        self.rst.set_low().unwrap();
+
+        delay_source.delay_ms(5);
+
+        self.rst.set_high().unwrap();
+
+        while self.int.is_high().unwrap_or(false) {
+            delay_source.delay_ms(1);
+        }
         // #[cfg(feature = "rttdebug")]
         // rprintln!("i2c setup");
         delay_source.delay_ms(5);
@@ -195,7 +151,7 @@ where
     fn read_with_timeout(
         &mut self,
         recv_buf: &mut [u8],
-        delay_source: &mut impl DelayMs<u8>,
+        delay_source: &mut impl DelayNs,
         max_ms: u8,
     ) -> Result<usize, Self::SensorError> {
         let mut total_delay: u8 = 0;
@@ -224,6 +180,10 @@ where
     ) -> Result<usize, Self::SensorError> {
         // #[cfg(feature = "rttdebug")]
         // rprintln!("rpkt");
+
+        if self.int.is_high().unwrap() {
+            return Ok(0);
+        }
 
         self.read_packet_header()?;
         let packet_len = SensorCommon::parse_packet_header(
@@ -256,6 +216,7 @@ where
     ) -> Result<usize, Self::SensorError> {
         // Cannot use write_read with bno080,
         // because it does not support repeated start with i2c.
+        while self.int.is_high().unwrap() {}
 
         self.i2c_port
             .write(self.address, send_buf)
@@ -265,23 +226,10 @@ where
         //stall before attempted read?
         Self::zero_buffer(recv_buf);
 
-        self.i2c_port
-            .read(self.address, &mut self.seg_recv_buf[..PACKET_HEADER_LENGTH])
-            .map_err(Error::Comm)?;
-
-        let packet_len = SensorCommon::parse_packet_header(
-            &self.seg_recv_buf[..PACKET_HEADER_LENGTH],
-        );
-
-        let received_len = if packet_len > PACKET_HEADER_LENGTH {
-            self.read_sized_packet(packet_len, recv_buf)?
-        } else {
-            packet_len
-        };
-        if packet_len > 0 {
-            self.received_packet_count += 1;
+        let mut received_len = 0;
+        while received_len == 0 {
+            received_len = self.read_packet(recv_buf)?;
         }
-
         Ok(received_len)
     }
 }
