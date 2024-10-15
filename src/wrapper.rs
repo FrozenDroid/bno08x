@@ -56,16 +56,14 @@ pub struct BNO080<SI> {
     last_exec_chan_rid: u8,
     last_command_chan_rid: u8,
 
-    /// Rotation vector as unit quaternion
-    rotation_quaternion: [f32; 4],
-    /// Heading accuracy of rotation vector (radians)
-    rot_quaternion_acc: f32,
+    /// Rotation vector as unit quaternion with heading accuracy of rotation vector (radians)
+    rotation_quaternion: Option<([f32; 4], f32)>,
 
     /// Linear acceleration vector
-    linear_accel: [f32; 3],
+    linear_accel: Option<[f32; 3]>,
 
     /// Gyroscope calibrated data
-    gyro: [f32; 3],
+    gyro: Option<[f32; 3]>,
 }
 
 impl<SI> BNO080<SI> {
@@ -85,10 +83,9 @@ impl<SI> BNO080<SI> {
             last_chan_received: 0,
             last_exec_chan_rid: 0,
             last_command_chan_rid: 0,
-            rotation_quaternion: [0.0; 4],
-            rot_quaternion_acc: 0.0,
-            linear_accel: [0.0; 3],
-            gyro: [0.0; 3],
+            rotation_quaternion: None,
+            linear_accel: None,
+            gyro: None,
         }
     }
 
@@ -305,13 +302,15 @@ where
         q_a: i16,
     ) {
         //debug_println!("rquat {} {} {} {} {}", q_i, q_j, q_k, q_r, q_a);
-        self.rotation_quaternion = [
-            q14_to_f32(q_i),
-            q14_to_f32(q_j),
-            q14_to_f32(q_k),
-            q14_to_f32(q_r),
-        ];
-        self.rot_quaternion_acc = q12_to_f32(q_a);
+        self.rotation_quaternion = Some((
+            [
+                q14_to_f32(q_i),
+                q14_to_f32(q_j),
+                q14_to_f32(q_k),
+                q14_to_f32(q_r),
+            ],
+            q12_to_f32(q_a),
+        ));
     }
 
     /// Given a set of linear acceleration values in the Q-fixed-point format,
@@ -321,7 +320,7 @@ where
         let y = q8_to_f32(y);
         let z = q8_to_f32(z);
 
-        self.linear_accel = [x, y, z];
+        self.linear_accel = Some([x, y, z]);
     }
 
     /// Given a set of linear acceleration values in the Q-fixed-point format,
@@ -331,7 +330,7 @@ where
         let y = q9_to_f32(y);
         let z = q9_to_f32(z);
 
-        self.gyro = [x, y, z];
+        self.gyro = Some([x, y, z]);
     }
 
     /// Handle one or more errors sent in response to a command
@@ -646,22 +645,22 @@ where
     /// QY normalized quaternion – Y, or Pitch   | range: 0.0 – 1.0 ( ±π/2 )
     /// QZ normalized quaternion – Z, or Roll    | range: 0.0 – 1.0 ( ±π )
     /// QW normalized quaternion – W, or 0.0     | range: 0.0 – 1.0
-    pub fn rotation_quaternion(&self) -> Result<[f32; 4], WrapperError<SE>> {
-        Ok(self.rotation_quaternion)
-    }
-
-    pub fn heading_accuracy(&self) -> f32 {
-        self.rot_quaternion_acc
+    pub fn rotation_quaternion(
+        &mut self,
+    ) -> Result<Option<([f32; 4], f32)>, WrapperError<SE>> {
+        Ok(self.rotation_quaternion.take())
     }
 
     /// Read linear acceleration (m/s^2)
-    pub fn linear_accel(&self) -> Result<[f32; 3], WrapperError<SE>> {
-        Ok(self.linear_accel)
+    pub fn linear_accel(
+        &mut self,
+    ) -> Result<Option<[f32; 3]>, WrapperError<SE>> {
+        Ok(self.linear_accel.take())
     }
 
     /// Read gyroscope data (rad/s)
-    pub fn gyro(&self) -> Result<[f32; 3], WrapperError<SE>> {
-        Ok(self.gyro)
+    pub fn gyro(&mut self) -> Result<Option<[f32; 3]>, WrapperError<SE>> {
+        Ok(self.gyro.take())
     }
 
     /// Tell the sensor to reset.
@@ -778,7 +777,7 @@ const SENSOR_REPORTID_LINEAR_ACCEL: u8 = 0x04;
 const SENSOR_REPORTID_ROTATION_VECTOR: u8 = 0x05;
 // const SENSOR_REPORTID_GRAVITY: u8 = 0x06; // Q point 8
 /// Gyroscope uncalibrated (rad/s): Q point 9
-const SENSOR_REPORTID_GYRO: u8 = 0x07;
+const SENSOR_REPORTID_GYRO: u8 = 0x02;
 // 0x08 game rotation vector : Q point 14
 // 0x09 geomagnetic rotation vector: Q point 14 for quaternion, Q point 12 for heading accuracy
 // 0x0A pressure (hectopascals) from external baro: Q point 20
