@@ -30,6 +30,7 @@ pub enum WrapperError<E> {
 
 pub struct BNO080<SI> {
     pub(crate) sensor_interface: SI,
+    cmd_seq_number: u8,
     /// each communication channel with the device has its own sequence number
     sequence_numbers: [u8; NUM_CHANNELS],
     /// buffer for building and sending packet to the sensor hub
@@ -66,10 +67,66 @@ pub struct BNO080<SI> {
     gyro: Option<[f32; 3]>,
 }
 
+#[derive(Debug)]
+struct RawCommandResponse {
+    pub report_id: u8, // pretty much always SHUB_COMMAND_RESP
+    pub seq: u8,
+    pub cmd: u8,
+    pub cmd_seq_num: u8,
+    pub resp_seq_num: u8,
+    pub data: heapless::Vec<u8, 64>,
+}
+
+impl RawCommandResponse {
+    fn new(msg: &[u8]) -> Self {
+        let mut data = heapless::Vec::new();
+        data.extend_from_slice(&msg[5..]).unwrap();
+        Self {
+            report_id: msg[0],
+            seq: msg[1],
+            cmd: msg[2],
+            cmd_seq_num: msg[3],
+            resp_seq_num: msg[4],
+            data,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[repr(u8)]
+pub enum MotionIntent {
+    Unknown = 0,
+    StationaryWithoutVibration = 1,
+    StationaryWithVibration = 2,
+    InMotion = 3,
+    InMotionAccelerating = 4,
+}
+
+#[derive(Debug)]
+pub struct CalibrationConfig {
+    pub accelerometer: bool,
+    pub gyroscope: bool,
+    pub magnetometer: bool,
+
+    pub planar_accel: bool,
+    pub on_table: bool,
+}
+
+#[derive(Debug)]
+pub enum CommandResponse {
+    Calibration(CalibrationConfig),
+}
+
+#[derive(Debug)]
+pub enum Packet {
+    Command(CommandResponse),
+}
+
 impl<SI> BNO080<SI> {
     pub fn new_with_interface(sensor_interface: SI) -> Self {
         Self {
             sensor_interface,
+            cmd_seq_number: 0,
             sequence_numbers: [0; NUM_CHANNELS],
             packet_send_buf: [0; PACKET_SEND_BUF_LEN],
             packet_recv_buf: [0; PACKET_RECV_BUF_LEN],
@@ -122,7 +179,8 @@ where
     ) -> u32 {
         let mut total_handled: u32 = 0;
         loop {
-            let handled_count = self.handle_one_message(delay, timeout_ms);
+            let (handled_count, packet) =
+                self.handle_one_message(delay, timeout_ms);
             if handled_count == 0 {
                 break;
             } else {
@@ -139,7 +197,7 @@ where
         &mut self,
         delay: &mut impl DelayNs,
         max_ms: u8,
-    ) -> u32 {
+    ) -> (u32, Option<Packet>) {
         let mut msg_count = 0;
 
         let res = self.receive_packet_with_timeout(delay, max_ms);
@@ -147,14 +205,14 @@ where
             let received_len = res.unwrap();
             if received_len > 0 {
                 msg_count += 1;
-                self.handle_received_packet(received_len);
+                return (msg_count, self.handle_received_packet(received_len));
             }
         } else {
             #[cfg(feature = "rttdebug")]
             rprintln!("handle1 err {:?}", res);
         }
 
-        msg_count
+        (msg_count, None)
     }
 
     /// Receive and ignore one message,
@@ -347,7 +405,10 @@ where
         }
     }
 
-    pub fn handle_received_packet(&mut self, received_len: usize) {
+    pub fn handle_received_packet(
+        &mut self,
+        received_len: usize,
+    ) -> Option<Packet> {
         let msg = &self.packet_recv_buf[..received_len];
         let chan_num = msg[2];
         //let _seq_num =  msg[3];
@@ -387,12 +448,24 @@ where
             CHANNEL_HUB_CONTROL => {
                 match report_id {
                     SHUB_COMMAND_RESP => {
-                        // 0xF1 / 241
-                        let cmd_resp = msg[6];
-                        if cmd_resp == SH2_STARTUP_INIT_UNSOLICITED {
+                        let response = RawCommandResponse::new(&msg[4..]);
+
+                        if response.cmd == SH2_STARTUP_INIT_UNSOLICITED {
                             self.init_received = true;
-                        } else if cmd_resp == SH2_INIT_SYSTEM {
+                        } else if response.cmd == SH2_INIT_SYSTEM {
                             self.init_received = true;
+                        } else if response.cmd == SHUB_CMD_ME_CALIBRATION_CMD {
+                            return Some(Packet::Command(
+                                CommandResponse::Calibration(
+                                    CalibrationConfig {
+                                        accelerometer: response.data[1] == 1,
+                                        gyroscope: response.data[2] == 1,
+                                        magnetometer: response.data[3] == 1,
+                                        planar_accel: response.data[4] == 1,
+                                        on_table: response.data[5] == 1,
+                                    },
+                                ),
+                            ));
                         }
                         #[cfg(feature = "rttdebug")]
                         rprintln!("CMD_RESP: 0x{:X}", cmd_resp);
@@ -436,6 +509,8 @@ where
                 rprintln!("unh chan 0x{:X}", chan_num);
             }
         }
+
+        None
     }
 
     /// The BNO080 starts up with all sensors disabled,
@@ -457,7 +532,7 @@ where
         if self.sensor_interface.requires_soft_reset() {
             delay_source.delay_ms(1);
             self.soft_reset()?;
-            delay_source.delay_ms(150);
+            delay_source.delay_ms(1500);
             self.eat_all_messages(delay_source);
             delay_source.delay_ms(50);
             self.eat_all_messages(delay_source);
@@ -471,6 +546,105 @@ where
 
         self.verify_product_id(delay_source)?;
         //self.eat_all_messages(delay_source);
+
+        Ok(())
+    }
+
+    pub fn enable_calibration(
+        &mut self,
+        config: &CalibrationConfig,
+    ) -> Result<(), WrapperError<SE>> {
+        let cmd_body = [
+            SHUB_COMMAND_REQ,
+            self.cmd_seq_number,
+            SHUB_CMD_ME_CALIBRATION_CMD,
+            config.accelerometer as u8,
+            config.gyroscope as u8,
+            config.magnetometer as u8,
+            0x00,
+            config.planar_accel as u8,
+            config.on_table as u8,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        self.cmd_seq_number += 1;
+
+        //we simply blast out this configuration command and assume it'll succeed
+        self.send_packet(CHANNEL_HUB_CONTROL, &cmd_body)?;
+        // any error or success in configuration will arrive some time later
+
+        Ok(())
+    }
+
+    pub fn get_calibration_config(
+        &mut self,
+        delay: &mut impl DelayNs,
+        timeout: u8,
+    ) -> Result<CalibrationConfig, WrapperError<SE>> {
+        let cmd_body = [
+            SHUB_COMMAND_REQ,
+            self.cmd_seq_number,
+            SHUB_CMD_ME_CALIBRATION_CMD,
+            0x00,
+            0x00,
+            0x00,
+            0x01, // get ME calibration
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        self.cmd_seq_number += 1;
+
+        self.send_packet(CHANNEL_HUB_CONTROL, &cmd_body)?;
+
+        let mut tries = 0;
+        loop {
+            match self.handle_one_message(delay, timeout / 100) {
+                (
+                    _,
+                    Some(Packet::Command(CommandResponse::Calibration(config))),
+                ) => {
+                    println!("got calibration {:?}", config);
+                    return Ok(config);
+                }
+                _ => {
+                    tries += 1;
+                    if tries > 100 {
+                        return Err(WrapperError::NoDataAvailable);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn set_interactive_calibration(
+        &mut self,
+        motion_intent: MotionIntent,
+    ) -> Result<(), WrapperError<SE>> {
+        let cmd_body = [
+            SHUB_COMMAND_REQ,
+            self.cmd_seq_number,
+            SHUB_CMD_INTERACTIVE_CALIBRATION_CMD,
+            motion_intent as u8,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        self.cmd_seq_number += 1;
+
+        self.send_packet(CHANNEL_HUB_CONTROL, &cmd_body)?;
+        // any error or success in configuration will arrive some time later
 
         Ok(())
     }
@@ -628,7 +802,7 @@ where
         while !self.prod_id_verified {
             #[cfg(feature = "rttdebug")]
             rprintln!("read PID");
-            let msg_count = self.handle_one_message(delay, 150u8);
+            let (msg_count, _) = self.handle_one_message(delay, 150u8);
             if msg_count < 1 {
                 break;
             }
@@ -757,11 +931,13 @@ const SHUB_PROD_ID_REQ: u8 = 0xF9;
 /// Report ID for Product ID response
 const SHUB_PROD_ID_RESP: u8 = 0xF8;
 const SHUB_GET_FEATURE_RESP: u8 = 0xFC;
+const SHUB_CMD_ME_CALIBRATION_CMD: u8 = 0x7;
+const SHUB_CMD_INTERACTIVE_CALIBRATION_CMD: u8 = 0x0E;
 const SHUB_REPORT_SET_FEATURE_CMD: u8 = 0xFD;
 // const SHUB_GET_FEATURE_REQ: u8 = 0xFE;
 // const SHUB_FORCE_SENSOR_FLUSH: u8 = 0xF0;
 const SHUB_COMMAND_RESP: u8 = 0xF1;
-//const SHUB_COMMAND_REQ:u8 =  0xF2;
+const SHUB_COMMAND_REQ: u8 = 0xF2;
 
 // some mysterious responses we sometimes get:
 // 0x78, 0x7C

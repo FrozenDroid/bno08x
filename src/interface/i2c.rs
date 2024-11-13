@@ -84,12 +84,9 @@ where
             *byte = 0;
         }
 
-        if total_packet_len > 0 {
+        if total_packet_len > 0 && total_packet_len < packet_recv_buf.len() {
             self.i2c_port
-                .read(
-                    self.address,
-                    &mut packet_recv_buf[..total_packet_len],
-                )
+                .read(self.address, &mut packet_recv_buf[..total_packet_len])
                 .map_err(Error::Comm)?;
             already_read_len = total_packet_len;
         }
@@ -117,7 +114,7 @@ where
     type SensorError = Error<CommE, ()>;
 
     fn requires_soft_reset(&self) -> bool {
-        false
+        true
     }
 
     fn setup(
@@ -126,16 +123,16 @@ where
     ) -> Result<(), Self::SensorError> {
         self.rst.set_low().unwrap();
 
-        delay_source.delay_ms(5);
+        delay_source.delay_ms(1000);
 
         self.rst.set_high().unwrap();
 
-        while self.int.is_high().unwrap_or(false) {
-            delay_source.delay_ms(1);
-        }
+        // while self.int.is_high().unwrap_or(false) {
+        //     delay_source.delay_ms(1);
+        // }
         // #[cfg(feature = "rttdebug")]
         // rprintln!("i2c setup");
-        delay_source.delay_ms(5);
+        delay_source.delay_ms(50);
         Ok(())
     }
 
@@ -181,9 +178,9 @@ where
         // #[cfg(feature = "rttdebug")]
         // rprintln!("rpkt");
 
-        if self.int.is_high().unwrap() {
-            return Ok(0);
-        }
+        // if self.int.is_high().unwrap() {
+        //     return Ok(0);
+        // }
 
         self.read_packet_header()?;
         let packet_len = SensorCommon::parse_packet_header(
@@ -216,7 +213,7 @@ where
     ) -> Result<usize, Self::SensorError> {
         // Cannot use write_read with bno080,
         // because it does not support repeated start with i2c.
-        while self.int.is_high().unwrap() {}
+        // while self.int.is_high().unwrap() {}
 
         self.i2c_port
             .write(self.address, send_buf)
