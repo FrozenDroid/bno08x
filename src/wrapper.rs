@@ -113,6 +113,13 @@ pub struct CalibrationConfig {
 }
 
 #[derive(Debug)]
+#[repr(u8)]
+pub enum Tare {
+    Heading = 0x04,
+    All = 0x07,
+}
+
+#[derive(Debug)]
 pub enum CommandResponse {
     Calibration(CalibrationConfig),
 }
@@ -550,6 +557,52 @@ where
         Ok(())
     }
 
+    pub fn tare(&mut self, tare: Tare) -> Result<(), WrapperError<SE>> {
+        let cmd_body = [
+            SHUB_COMMAND_REQ,
+            self.cmd_seq_number,
+            SHUB_CMD_TARE_CMD,
+            0x00,       // tare now
+            tare as u8, // gyroscope
+            0x00,       // rotation vector (?)
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        self.cmd_seq_number += 1;
+
+        self.send_packet(CHANNEL_HUB_CONTROL, &cmd_body)?;
+
+        Ok(())
+    }
+
+    pub fn persist_tare(&mut self) -> Result<(), WrapperError<SE>> {
+        let cmd_body = [
+            SHUB_COMMAND_REQ,
+            self.cmd_seq_number,
+            SHUB_CMD_TARE_CMD,
+            0x01, // persist tare
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+        ];
+
+        self.cmd_seq_number += 1;
+
+        self.send_packet(CHANNEL_HUB_CONTROL, &cmd_body)?;
+
+        Ok(())
+    }
+
     pub fn enable_calibration(
         &mut self,
         config: &CalibrationConfig,
@@ -931,6 +984,7 @@ const SHUB_PROD_ID_REQ: u8 = 0xF9;
 /// Report ID for Product ID response
 const SHUB_PROD_ID_RESP: u8 = 0xF8;
 const SHUB_GET_FEATURE_RESP: u8 = 0xFC;
+const SHUB_CMD_TARE_CMD: u8 = 0x3;
 const SHUB_CMD_ME_CALIBRATION_CMD: u8 = 0x7;
 const SHUB_CMD_INTERACTIVE_CALIBRATION_CMD: u8 = 0x0E;
 const SHUB_REPORT_SET_FEATURE_CMD: u8 = 0xFD;
